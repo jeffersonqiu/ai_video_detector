@@ -20,10 +20,10 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    telegram_bot_token: str
-    gemini_api_key: str
-    allowed_telegram_user_id: int
-    webhook_secret: str
+    telegram_bot_token: str = ""
+    gemini_api_key: str = ""
+    allowed_telegram_user_id: int = 0
+    webhook_secret: str = ""
     railway_public_domain: str = ""
     instagram_cookies_file: Optional[str] = None
     daily_request_limit: int = 50

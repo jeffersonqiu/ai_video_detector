@@ -7,8 +7,15 @@ from models import DetectionResult
 
 logger = logging.getLogger(__name__)
 
-# Initialised once at module load; reads GEMINI_API_KEY from environment automatically
-client = genai.Client()
+# Lazy singleton — created on first API call so import never crashes
+_client: genai.Client | None = None
+
+
+def _get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        _client = genai.Client()
+    return _client
 
 DETECTION_PROMPT = """\
 You are an expert at detecting AI-generated video content. Analyse these video frames carefully.
@@ -73,7 +80,7 @@ async def detect_ai_video(frame_paths: list[str]) -> DetectionResult:
             image_bytes = f.read()
         parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
 
-    response = await client.aio.models.generate_content(
+    response = await _get_client().aio.models.generate_content(
         model="gemini-2.5-flash-lite",
         contents=parts,
         config=types.GenerateContentConfig(

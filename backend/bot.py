@@ -121,6 +121,3 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     return app
-
-
-application = build_application()
