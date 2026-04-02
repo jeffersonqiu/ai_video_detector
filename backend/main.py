@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 from contextlib import asynccontextmanager
 
@@ -31,9 +32,26 @@ async def _register_webhook() -> None:
         logger.exception("Failed to register Telegram webhook.")
 
 
+def _bootstrap_instagram_cookies() -> None:
+    """If INSTAGRAM_COOKIES_B64 is set, decode it and write to /tmp so yt-dlp can use it."""
+    b64 = settings.instagram_cookies_b64
+    if not b64:
+        return
+    cookies_path = "/tmp/instagram_cookies.txt"
+    try:
+        content = base64.b64decode(b64.strip()).decode("utf-8")
+        with open(cookies_path, "w") as f:
+            f.write(content)
+        settings.instagram_cookies_file = cookies_path
+        logger.info(f"Instagram cookies written to {cookies_path}")
+    except Exception:
+        logger.exception("Failed to decode INSTAGRAM_COOKIES_B64 — Instagram may fail.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _application
+    _bootstrap_instagram_cookies()
     try:
         from bot import build_application
         _application = build_application()

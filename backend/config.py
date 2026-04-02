@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     webhook_secret: str = ""
     railway_public_domain: str = ""
     instagram_cookies_file: Optional[str] = None
+    instagram_cookies_b64: Optional[str] = None   # base64-encoded cookies.txt for Railway
     daily_request_limit: int = 50
 
     @field_validator("telegram_bot_token", "gemini_api_key", "webhook_secret", mode="before")
