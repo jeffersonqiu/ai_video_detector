@@ -1,0 +1,14 @@
+[project]
+name = "ai-video-detector"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-telegram-bot>=22.7",
+    "yt-dlp>=2026.3.17",
+    "google-genai>=1.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "httpx>=0.27.0",
+]
