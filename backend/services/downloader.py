@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from dataclasses import dataclass
 
 from yt_dlp import YoutubeDL
 
@@ -17,6 +18,13 @@ class UnsupportedPlatformError(Exception):
     pass
 
 
+@dataclass
+class VideoInfo:
+    uploader: str
+    description: str
+    duration_seconds: int | None
+
+
 def _is_instagram(url: str) -> bool:
     return "instagram.com/reel/" in url
 
@@ -25,21 +33,30 @@ def _is_tiktok(url: str) -> bool:
     return "tiktok.com/" in url or "vm.tiktok.com/" in url
 
 
+def _extract_video_info(info: dict) -> VideoInfo:
+    uploader = (
+        info.get("uploader")
+        or info.get("channel")
+        or info.get("creator")
+        or "Unknown"
+    )
+    description = (info.get("description") or info.get("title") or "").strip()
+    # Trim long descriptions
+    if len(description) > 120:
+        description = description[:117] + "..."
+    duration = info.get("duration")
+    return VideoInfo(
+        uploader=uploader,
+        description=description,
+        duration_seconds=int(duration) if duration else None,
+    )
+
+
 def _find_downloaded_file(output_dir: str, info: dict) -> str:
-    """
-    Resolve the actual downloaded file path using multiple fallback strategies,
-    matching the pattern from the existing insta_reels_tools project.
-    """
-    # Strategy 1: info["filepath"] set by yt-dlp post-processor
     filepath = info.get("filepath") if isinstance(info, dict) else None
     if filepath and os.path.exists(filepath):
         return filepath
 
-    # Strategy 2: prepare_filename from the outtmpl template
-    # This may not reflect the final merged filename, but try it
-    # We can't call prepare_filename here without ydl instance, so skip
-
-    # Strategy 3: glob for the largest non-partial file in output_dir
     candidates: list[str] = []
     for root, _, files in os.walk(output_dir):
         for name in files:
@@ -68,18 +85,21 @@ def _build_ydl_opts(output_dir: str, cookiefile: str | None = None) -> dict:
     return opts
 
 
-def _download_sync(url: str, output_dir: str, cookiefile: str | None = None) -> str:
+def _download_sync(url: str, output_dir: str, cookiefile: str | None = None) -> tuple[str, VideoInfo]:
     ydl_opts = _build_ydl_opts(output_dir, cookiefile)
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        return _find_downloaded_file(output_dir, info if isinstance(info, dict) else {})
+        info = info if isinstance(info, dict) else {}
+        filepath = _find_downloaded_file(output_dir, info)
+        video_info = _extract_video_info(info)
+        return filepath, video_info
 
 
-async def download_video(url: str, output_dir: str) -> str:
+async def download_video(url: str, output_dir: str) -> tuple[str, VideoInfo]:
     """
     Downloads video from an Instagram Reel or TikTok URL.
 
-    Returns the absolute path to the downloaded video file.
+    Returns (filepath, VideoInfo).
     Raises UnsupportedPlatformError for non-IG/TikTok URLs.
     Raises DownloadError if download fails after cookie fallback.
     """
@@ -93,7 +113,6 @@ async def download_video(url: str, output_dir: str) -> str:
     except Exception as exc:
         msg = str(exc).lower()
 
-        # Instagram auth failure — attempt cookie fallback
         if _is_instagram(url) and ("login required" in msg or "rate-limit" in msg or "rate limit" in msg):
             cookies_path = settings.instagram_cookies_file
             if cookies_path and os.path.exists(cookies_path):
