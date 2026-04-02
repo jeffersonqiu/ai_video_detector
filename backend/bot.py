@@ -23,10 +23,9 @@ from services.frame_extractor import FrameExtractionError, extract_frames_async
 
 logger = logging.getLogger(__name__)
 
-# Matches Instagram Reels and TikTok URLs embedded anywhere in a message
+# Matches Instagram Reels and TikTok URLs (any subdomain: vm, vt, m, www, etc.)
 _URL_RE = re.compile(
-    r"https?://(?:www\.)?"
-    r"(?:instagram\.com/reel/\S+|tiktok\.com/\S+|vm\.tiktok\.com/\S+)"
+    r"https?://(?:[\w-]+\.)*(?:instagram\.com/reel/|tiktok\.com/)\S+"
 )
 
 
