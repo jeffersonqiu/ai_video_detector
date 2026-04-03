@@ -130,12 +130,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         confidence_emoji = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(
             result.confidence, "⚪"
         )
+        model_label = "⚡ Flash-Lite" if "lite" in result.model_used else "🔥 Flash (escalated)"
+        total_tokens = result.input_tokens + result.output_tokens
+        cost_str = f"${result.cost_usd:.5f}" if result.cost_usd > 0 else "—"
 
         await status_msg.edit_text(
             f"{verdict_emoji} <b>{_h(result.verdict)}</b>\n"
             f"{confidence_emoji} Confidence: <b>{_h(result.confidence)}</b>\n\n"
             f"📝 {_h(result.reason)}\n\n"
-            f"— @{_h(video_info.uploader)}",
+            f"— @{_h(video_info.uploader)}\n"
+            f"<i>{model_label} · {total_tokens:,} tokens · {cost_str}</i>",
             parse_mode=ParseMode.HTML,
         )
 
