@@ -95,17 +95,56 @@ Leave it as-is unless you have a reason to change it.
 
 ---
 
-## Step 7 — INSTAGRAM_COOKIES_FILE (optional — skip for now)
+## Step 7 — INSTAGRAM_COOKIES_B64 (optional — only if Instagram fails)
 
-Skip this initially. Only set it if Instagram downloads start failing with a "login required" error.
+Skip this initially. Only set it if you see errors like:
+- `HTTP Error 429: Too Many Requests`
+- `login required`
 
-If that happens:
-1. On your Mac, open **Chrome** and log into Instagram
-2. Install the Chrome extension **"Get cookies.txt LOCALLY"**
-3. Go to `instagram.com` → click the extension → export as **Netscape format**
-4. Save the file as `instagram_cookies.txt`
-5. Upload it to Railway as a volume or store it somewhere accessible
-6. Set `INSTAGRAM_COOKIES_FILE=/path/to/instagram_cookies.txt`
+Railway's server IP gets rate-limited by Instagram for unauthenticated requests.
+Providing your cookies lets yt-dlp download as your logged-in account.
+
+### How to export your Instagram cookies (no extension needed)
+
+Make sure you have `uv` and `yt-dlp` available locally. Log into Instagram in Chrome first, then run:
+
+```bash
+yt-dlp --cookies-from-browser chrome \
+       --cookies ~/Desktop/instagram_cookies.txt \
+       --skip-download \
+       "https://www.instagram.com/reel/C0000000000/"
+```
+
+> This reads your cookies directly from Chrome and writes them to `instagram_cookies.txt` on your Desktop. Replace the URL with any real Instagram Reel — it won't download the video, just extract the cookies.
+
+If you use **Safari** instead of Chrome:
+```bash
+yt-dlp --cookies-from-browser safari \
+       --cookies ~/Desktop/instagram_cookies.txt \
+       --skip-download \
+       "https://www.instagram.com/reel/C0000000000/"
+```
+
+### Convert and upload to Railway
+
+Once you have `instagram_cookies.txt`, convert it to base64:
+
+```bash
+base64 -i ~/Desktop/instagram_cookies.txt | tr -d '\n'
+```
+
+Copy the entire output (one long line), then add it to Railway:
+
+1. Railway dashboard → your service → **Variables**
+2. Add new variable: `INSTAGRAM_COOKIES_B64` = *(paste the base64 string)*
+3. Save — Railway redeploys automatically
+
+You'll see this in the logs on next startup:
+```
+Instagram cookies written to /tmp/instagram_cookies.txt
+```
+
+> **Cookies expire** after a few weeks or when you log out of Instagram. If Instagram starts failing again, re-run the export command and update `INSTAGRAM_COOKIES_B64` in Railway.
 
 ---
 
