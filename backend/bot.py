@@ -46,6 +46,21 @@ def _h(text: str) -> str:
     return html.escape(str(text))
 
 
+def _is_allowed(update: Update) -> bool:
+    """
+    Allow the request if:
+    - The user is the whitelisted owner, OR
+    - The message comes from a whitelisted group chat
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    if user and user.id == settings.allowed_telegram_user_id:
+        return True
+    if chat and chat.id in settings.get_allowed_chat_ids():
+        return True
+    return False
+
+
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     logger.info(f"/start from user_id={user.id if user else 'unknown'}")
@@ -54,6 +69,20 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Send me an Instagram Reel or TikTok link and I'll tell you "
         "if the video was AI-generated.\n\n"
         "Just paste the link as a message."
+    )
+
+
+async def chatid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply with the current chat ID — useful for adding a group to ALLOWED_CHAT_IDS."""
+    chat = update.effective_chat
+    user = update.effective_user
+    # Only the owner can use this command
+    if not user or user.id != settings.allowed_telegram_user_id:
+        return
+    await update.message.reply_text(
+        f"Chat ID: <code>{chat.id}</code>\n\n"
+        f"Add this to <b>ALLOWED_CHAT_IDS</b> in Railway to allow this chat.",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -82,8 +111,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not user:
         return
 
-    if user.id != settings.allowed_telegram_user_id:
-        logger.warning(f"Rejected message from non-whitelisted user_id={user.id}")
+    if not _is_allowed(update):
+        logger.warning(f"Rejected message from user_id={user.id} chat_id={update.effective_chat.id}")
         await update.message.reply_text("Sorry, this bot is private.")
         return
 
@@ -91,6 +120,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     url = _extract_url(text)
 
     if not url:
+        # In groups, stay silent when no URL (avoid spamming for every message)
+        chat = update.effective_chat
+        if chat and chat.type != "private":
+            return
         await update.message.reply_text("Please send an Instagram Reel or TikTok link.")
         return
 
@@ -103,6 +136,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     job_id = str(uuid.uuid4())
     job_dir = f"/tmp/detector_{job_id}"
     os.makedirs(job_dir, exist_ok=True)
+
+    frame_paths: list[str] = []
 
     try:
         # 1. Download
@@ -119,7 +154,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode=ParseMode.HTML,
         )
 
-        # 3. Extract frames + detect (pass caption + audio as extra signals)
+        # 3. Extract frames + detect
         frame_paths = await extract_frames_async(video_path, job_dir)
         result = await detect_ai_video(
             frame_paths,
@@ -127,7 +162,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             video_path=video_path,
         )
 
-        # 4. Send verdict
+        # 4. Build verdict text
         verdict_emoji = {"AI GENERATED": "🤖", "LIKELY REAL": "✅", "UNCERTAIN": "❓"}.get(
             result.verdict, "❓"
         )
@@ -143,14 +178,27 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         total_tokens = result.input_tokens + result.output_tokens
         cost_str = f"${result.cost_usd:.5f}" if result.cost_usd > 0 else "—"
 
-        await status_msg.edit_text(
+        verdict_caption = (
             f"{verdict_emoji} <b>{_h(result.verdict)}</b>\n"
             f"{confidence_emoji} Confidence: <b>{_h(result.confidence)}</b>\n\n"
             f"📝 {_h(result.reason)}\n\n"
             f"— @{_h(video_info.uploader)}\n"
-            f"<i>{model_label} · {total_tokens:,} tokens · {cost_str}</i>",
-            parse_mode=ParseMode.HTML,
+            f"<i>{model_label} · {total_tokens:,} tokens · {cost_str}</i>"
         )
+
+        # 5. Send verdict — as photo (middle frame) with caption if frames available,
+        #    otherwise fall back to editing the status text message
+        middle_frame = frame_paths[len(frame_paths) // 2] if frame_paths else None
+        if middle_frame and os.path.exists(middle_frame):
+            await status_msg.delete()
+            with open(middle_frame, "rb") as f:
+                await update.message.reply_photo(
+                    photo=f,
+                    caption=verdict_caption,
+                    parse_mode=ParseMode.HTML,
+                )
+        else:
+            await status_msg.edit_text(verdict_caption, parse_mode=ParseMode.HTML)
 
     except UnsupportedPlatformError:
         await status_msg.edit_text("❌ Only Instagram Reels and TikTok links are supported.")
@@ -160,7 +208,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await status_msg.edit_text(f"❌ Could not process video frames: {_h(str(e))}")
     except Exception as e:
         logger.exception(f"Pipeline error for URL {url!r}: {e}")
-        # Show actual error so you can diagnose — remove the error detail once stable
         await status_msg.edit_text(
             f"❌ Something went wrong:\n<code>{_h(type(e).__name__)}: {_h(str(e))}</code>",
             parse_mode=ParseMode.HTML,
@@ -173,5 +220,6 @@ def build_application() -> Application:
     app = Application.builder().token(settings.telegram_bot_token).build()
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("debug", debug_handler))
+    app.add_handler(CommandHandler("chatid", chatid_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     return app
