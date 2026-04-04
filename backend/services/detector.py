@@ -190,24 +190,39 @@ def _build_prompt(caption: str | None, has_audio: bool = False) -> str:
 # Response parsing
 # ---------------------------------------------------------------------------
 
-def _parse_verdict(text: str) -> DetectionResult:
+def _parse_verdict(text: str) -> DetectionResult | None:
+    """
+    Robustly extract VERDICT/CONFIDENCE/REASON from model output.
+    Handles markdown bold (**VERDICT:**), leading symbols, and lines
+    where the keyword appears anywhere (not just at line start).
+    Returns None if parsing fails so callers can retry.
+    """
+    import re
+
+    # Strip common markdown formatting
+    clean = re.sub(r"\*+", "", text)
+
     verdict = confidence = reason = None
-    for line in text.strip().splitlines():
-        if line.startswith("VERDICT:"):
-            verdict = line.replace("VERDICT:", "").strip()
-        elif line.startswith("CONFIDENCE:"):
-            confidence = line.replace("CONFIDENCE:", "").strip()
-        elif line.startswith("REASON:"):
-            reason = line.replace("REASON:", "").strip()
+
+    for line in clean.splitlines():
+        line = line.strip()
+        # Match "VERDICT:" anywhere in the line (model sometimes indents or prefixes)
+        if re.search(r"\bVERDICT\s*:", line, re.IGNORECASE):
+            val = re.split(r"VERDICT\s*:", line, flags=re.IGNORECASE, maxsplit=1)[-1].strip()
+            if val:
+                verdict = val
+        elif re.search(r"\bCONFIDENCE\s*:", line, re.IGNORECASE):
+            val = re.split(r"CONFIDENCE\s*:", line, flags=re.IGNORECASE, maxsplit=1)[-1].strip()
+            if val:
+                confidence = val
+        elif re.search(r"\bREASON\s*:", line, re.IGNORECASE):
+            val = re.split(r"REASON\s*:", line, flags=re.IGNORECASE, maxsplit=1)[-1].strip()
+            if val:
+                reason = val
 
     if not all([verdict, confidence, reason]):
         logger.warning(f"Could not fully parse response: {text!r}")
-        return DetectionResult(
-            verdict="UNCERTAIN",
-            confidence="LOW",
-            reason="Could not parse model response clearly.",
-            raw_response=text,
-        )
+        return None
 
     return DetectionResult(
         verdict=verdict,
@@ -242,7 +257,7 @@ def _build_gemini_config(model: str) -> types.GenerateContentConfig:
     if model == "gemini-2.5-flash":
         extra["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
     return types.GenerateContentConfig(
-        max_output_tokens=500,  # increased to allow full step-by-step reasoning
+        max_output_tokens=1024,
         temperature=0.1,
         safety_settings=_SAFETY_SETTINGS,
         **extra,
@@ -258,6 +273,14 @@ def _finish_reason(response) -> str:
         return "UNKNOWN"
 
 
+_SIMPLE_PROMPT_SUFFIX = """
+
+IMPORTANT: You MUST end your response with EXACTLY these three lines, no matter what:
+VERDICT: [AI GENERATED / LIKELY REAL / UNCERTAIN]
+CONFIDENCE: [HIGH / MEDIUM / LOW]
+REASON: [One sentence]"""
+
+
 async def _call_gemini(
     image_parts: list[types.Part],
     model: str,
@@ -265,7 +288,8 @@ async def _call_gemini(
     audio_path: str | None = None,
 ) -> tuple[DetectionResult | None, int, int]:
     has_audio = audio_path is not None
-    parts: list[types.Part] = [types.Part.from_text(text=_build_prompt(caption, has_audio))]
+    prompt = _build_prompt(caption, has_audio) + _SIMPLE_PROMPT_SUFFIX
+    parts: list[types.Part] = [types.Part.from_text(text=prompt)]
 
     if audio_path:
         with open(audio_path, "rb") as f:
@@ -288,7 +312,37 @@ async def _call_gemini(
     usage = response.usage_metadata
     input_tokens = (usage.prompt_token_count or 0) if usage else 0
     output_tokens = (usage.candidates_token_count or 0) if usage else 0
-    return _parse_verdict(text), input_tokens, output_tokens
+
+    result = _parse_verdict(text)
+    if result is None:
+        # Retry with explicit extraction instruction
+        logger.warning(f"Parse failed on first attempt, retrying with extraction prompt.")
+        retry_parts = [
+            types.Part.from_text(
+                "From the analysis below, extract and output ONLY these three lines:\n"
+                "VERDICT: [AI GENERATED / LIKELY REAL / UNCERTAIN]\n"
+                "CONFIDENCE: [HIGH / MEDIUM / LOW]\n"
+                "REASON: [one sentence]\n\n"
+                f"Analysis:\n{text}"
+            )
+        ]
+        retry_response = await _get_gemini().aio.models.generate_content(
+            model=model,
+            contents=retry_parts,
+            config=_build_gemini_config(model),
+        )
+        retry_text = retry_response.text or ""
+        retry_usage = retry_response.usage_metadata
+        input_tokens += (retry_usage.prompt_token_count or 0) if retry_usage else 0
+        output_tokens += (retry_usage.candidates_token_count or 0) if retry_usage else 0
+        result = _parse_verdict(retry_text) or DetectionResult(
+            verdict="UNCERTAIN",
+            confidence="LOW",
+            reason="Could not extract verdict from model response.",
+            raw_response=retry_text,
+        )
+
+    return result, input_tokens, output_tokens
 
 
 async def _call_claude(
@@ -297,9 +351,9 @@ async def _call_claude(
     has_audio: bool = False,
 ) -> tuple[DetectionResult, int, int]:
     model = "claude-haiku-4-5-20251001"
-    prompt = _build_prompt(caption, has_audio=False)
+    prompt = _build_prompt(caption, has_audio=False) + _SIMPLE_PROMPT_SUFFIX
     if has_audio:
-        prompt += "\nNote: Audio analysis is not available for this response — base your verdict on visual frames and caption only."
+        prompt += "\nNote: Audio analysis is not available — base verdict on visual frames and caption only."
     content: list[dict] = [{"type": "text", "text": prompt}]
 
     for frame_path in frame_paths:
@@ -312,22 +366,51 @@ async def _call_claude(
 
     response = await _get_claude().messages.create(
         model=model,
-        max_tokens=500,  # increased to allow full reasoning
+        max_tokens=1024,
         messages=[{"role": "user", "content": content}],
     )
 
     text = response.content[0].text if response.content else None
+    input_tokens = response.usage.input_tokens
+    output_tokens = response.usage.output_tokens
+
     if not text:
         return DetectionResult(
             verdict="UNCERTAIN",
             confidence="LOW",
             reason="Claude returned no response.",
             raw_response=None,
-        ), 0, 0
+        ), input_tokens, output_tokens
 
-    input_tokens = response.usage.input_tokens
-    output_tokens = response.usage.output_tokens
-    return _parse_verdict(text), input_tokens, output_tokens
+    result = _parse_verdict(text)
+    if result is None:
+        # Retry: ask Claude to extract the verdict from its own analysis
+        logger.warning("Claude parse failed — retrying with extraction prompt.")
+        retry_response = await _get_claude().messages.create(
+            model=model,
+            max_tokens=200,
+            messages=[
+                {"role": "user", "content": content},
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": (
+                    "Output ONLY the three verdict lines from your analysis above:\n"
+                    "VERDICT: [AI GENERATED / LIKELY REAL / UNCERTAIN]\n"
+                    "CONFIDENCE: [HIGH / MEDIUM / LOW]\n"
+                    "REASON: [one sentence]"
+                )},
+            ],
+        )
+        retry_text = retry_response.content[0].text if retry_response.content else ""
+        input_tokens += retry_response.usage.input_tokens
+        output_tokens += retry_response.usage.output_tokens
+        result = _parse_verdict(retry_text) or DetectionResult(
+            verdict="UNCERTAIN",
+            confidence="LOW",
+            reason="Could not extract verdict from model response.",
+            raw_response=retry_text,
+        )
+
+    return result, input_tokens, output_tokens
 
 
 # ---------------------------------------------------------------------------
