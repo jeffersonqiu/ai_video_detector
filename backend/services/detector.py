@@ -13,14 +13,15 @@ _MODEL_COSTS: dict[str, tuple[float, float]] = {
     "gemini-2.5-flash":      (0.30, 1.00),
 }
 
-# Relax safety thresholds to BLOCK_ONLY_HIGH so that normal lifestyle/beauty
-# videos don't get falsely flagged. The detection prompt mentions skin, faces,
-# and body parts in a forensic context which can trip default MEDIUM filters.
+# Disable safety blocking entirely for this use case.
+# The detection prompt uses forensic language about skin, faces, and body parts
+# which trips Gemini's filters even on completely normal lifestyle/beauty videos.
+# This is a private single-user bot — the content is user-chosen, not generated.
 _SAFETY_SETTINGS = [
-    types.SafetySetting(category="HARM_CATEGORY_HARASSMENT",        threshold="BLOCK_ONLY_HIGH"),
-    types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH",       threshold="BLOCK_ONLY_HIGH"),
-    types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_ONLY_HIGH"),
-    types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_ONLY_HIGH"),
+    types.SafetySetting(category="HARM_CATEGORY_HARASSMENT",        threshold="BLOCK_NONE"),
+    types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH",       threshold="BLOCK_NONE"),
+    types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+    types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
 ]
 
 # Lazy singleton — created on first API call so import never crashes
@@ -99,10 +100,17 @@ def _build_config(model: str) -> types.GenerateContentConfig:
 
 
 def _finish_reason(response) -> str:
-    """Extract finish reason string from the first candidate, if available."""
+    """Extract finish reason from the response.
+
+    When a prompt is blocked before any candidates are generated,
+    response.candidates is None — not an empty list — so indexing it
+    raises TypeError, not IndexError. Catch all three.
+    """
     try:
+        if response.prompt_feedback and response.prompt_feedback.block_reason:
+            return f"PROMPT_BLOCKED({response.prompt_feedback.block_reason})"
         return str(response.candidates[0].finish_reason)
-    except (AttributeError, IndexError):
+    except (AttributeError, IndexError, TypeError):
         return "UNKNOWN"
 
 
