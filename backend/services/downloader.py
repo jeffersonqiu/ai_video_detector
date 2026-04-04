@@ -113,21 +113,30 @@ async def download_video(url: str, output_dir: str) -> tuple[str, VideoInfo]:
     except Exception as exc:
         msg = str(exc).lower()
 
-        if _is_instagram(url) and ("login required" in msg or "rate-limit" in msg or "rate limit" in msg):
+        if _is_instagram(url) and (
+            "login required" in msg
+            or "rate-limit" in msg
+            or "rate limit" in msg
+            or "429" in msg
+            or "too many requests" in msg
+        ):
             cookies_path = settings.instagram_cookies_file
             if cookies_path and os.path.exists(cookies_path):
-                logger.warning("Instagram unauthenticated download failed; retrying with cookies.")
+                logger.warning("Instagram rate-limited or auth failed; retrying with cookies.")
                 try:
                     return await loop.run_in_executor(
                         None, _download_sync, url, output_dir, cookies_path
                     )
                 except Exception as retry_exc:
                     raise DownloadError(
-                        "Instagram blocked this download even with cookies. "
-                        "Try refreshing your cookies.txt file."
+                        "Instagram blocked this download even with cookies — "
+                        "your cookies may have expired. Re-export instagram_cookies.txt "
+                        "and update INSTAGRAM_COOKIES_B64 in Railway."
                     ) from retry_exc
             raise DownloadError(
-                "Instagram requires login. Set INSTAGRAM_COOKIES_FILE to enable cookie auth."
+                "Instagram is rate-limiting this server. "
+                "Set INSTAGRAM_COOKIES_B64 in Railway to authenticate — "
+                "see GUIDE.md for instructions."
             ) from exc
 
         if "private" in msg:
