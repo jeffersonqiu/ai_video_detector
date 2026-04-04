@@ -12,9 +12,10 @@ logger = logging.getLogger(__name__)
 
 # Cost per 1M tokens: (input, output)
 _MODEL_COSTS: dict[str, tuple[float, float]] = {
-    "gemini-2.5-flash-lite":       (0.10, 0.40),
-    "gemini-2.5-flash":            (0.30, 1.00),
-    "claude-haiku-4-5-20251001":   (0.80, 4.00),
+    "claude-sonnet-4-6":           (3.00, 15.00),
+    "gemini-2.5-flash":            (0.30,  1.00),
+    "gemini-2.5-flash-lite":       (0.10,  0.40),
+    "claude-haiku-4-5-20251001":   (0.80,  4.00),
 }
 
 _SAFETY_SETTINGS = [
@@ -349,8 +350,8 @@ async def _call_claude(
     frame_paths: list[str],
     caption: str | None = None,
     has_audio: bool = False,
+    model: str = "claude-sonnet-4-6",
 ) -> tuple[DetectionResult, int, int]:
-    model = "claude-haiku-4-5-20251001"
     prompt = _build_prompt(caption, has_audio=False) + _SIMPLE_PROMPT_SUFFIX
     if has_audio:
         prompt += "\nNote: Audio analysis is not available — base verdict on visual frames and caption only."
@@ -384,8 +385,7 @@ async def _call_claude(
 
     result = _parse_verdict(text)
     if result is None:
-        # Retry: ask Claude to extract the verdict from its own analysis
-        logger.warning("Claude parse failed — retrying with extraction prompt.")
+        logger.warning(f"{model} parse failed — retrying with extraction prompt.")
         retry_response = await _get_claude().messages.create(
             model=model,
             max_tokens=200,
@@ -426,12 +426,10 @@ async def detect_ai_video(
     Multi-signal detection pipeline:
       - Caption pre-screened for AI keywords before vision calls
       - Structured prompt forces model to reason per-signal then synthesize
-      - Three-tier model escalation: Flash-Lite → Flash → Claude Haiku
 
     Escalation logic:
-      1. gemini-2.5-flash-lite  — fast and cheap
-      2. gemini-2.5-flash       — if confidence is LOW
-      3. claude-haiku-4-5       — if Gemini blocks (model-level refusal)
+      1. claude-sonnet-4-6   — primary; best reasoning, vision + caption
+      2. gemini-2.5-flash    — escalation if LOW confidence (adds audio support)
     """
     from services.audio_extractor import extract_audio_async
 
@@ -439,7 +437,7 @@ async def detect_ai_video(
     if caption:
         logger.info(f"Caption: {caption[:80]!r} → signal={signal}")
 
-    # Extract audio
+    # Extract audio (used by Gemini escalation tier)
     audio_path: str | None = None
     if video_path:
         output_dir = os.path.dirname(frame_paths[0])
@@ -450,44 +448,40 @@ async def detect_ai_video(
 
     has_audio = audio_path is not None
 
-    # Build Gemini image parts
-    image_parts: list[types.Part] = []
-    for frame_path in frame_paths:
-        with open(frame_path, "rb") as f:
-            image_parts.append(types.Part.from_bytes(data=f.read(), mime_type="image/jpeg"))
+    # Tier 1: Claude Sonnet — vision + caption + structured reasoning
+    model = "claude-sonnet-4-6"
+    result, input_tokens, output_tokens = await _call_claude(
+        frame_paths, caption, has_audio, model=model
+    )
+    logger.info(f"{model}: verdict={result.verdict} confidence={result.confidence} caption_signal={signal}")
 
-    # Tier 1: Flash-Lite
-    model = "gemini-2.5-flash-lite"
-    result, input_tokens, output_tokens = await _call_gemini(image_parts, model, caption, audio_path)
-    if result:
-        logger.info(f"{model}: verdict={result.verdict} confidence={result.confidence} caption_signal={signal}")
+    # Tier 2: Gemini Flash — escalate if LOW confidence or strong caption conflicts with verdict
+    # Gemini also brings audio analysis which Claude doesn't support
+    should_escalate = result.confidence == "LOW" or (
+        signal == "STRONG" and result.verdict != "AI GENERATED"
+    )
+    if should_escalate:
+        reason = "low confidence" if result.confidence == "LOW" else "strong caption signal conflicts with verdict"
+        logger.info(f"Escalating to gemini-2.5-flash ({reason}).")
 
-    # Tier 2: Flash — escalate if low confidence OR caption signal is STRONG but verdict disagrees
-    should_escalate = False
-    if result:
-        if result.confidence == "LOW":
-            should_escalate = True
-            logger.info("Low confidence — escalating to gemini-2.5-flash.")
-        elif signal == "STRONG" and result.verdict != "AI GENERATED":
-            should_escalate = True
-            logger.info(
-                f"Strong caption signal but verdict={result.verdict} — escalating to gemini-2.5-flash for confirmation."
-            )
+        image_parts: list[types.Part] = []
+        for frame_path in frame_paths:
+            with open(frame_path, "rb") as f:
+                image_parts.append(types.Part.from_bytes(data=f.read(), mime_type="image/jpeg"))
 
-    if result and should_escalate:
         model = "gemini-2.5-flash"
-        result, input_tokens, output_tokens = await _call_gemini(image_parts, model, caption, audio_path)
-        if result:
+        gemini_result, g_input, g_output = await _call_gemini(
+            image_parts, model, caption, audio_path
+        )
+        if gemini_result:
+            result, input_tokens, output_tokens = gemini_result, g_input, g_output
             logger.info(f"{model}: verdict={result.verdict} confidence={result.confidence}")
+        else:
+            # Gemini blocked — stick with Sonnet result
+            logger.info("Gemini escalation blocked — keeping Sonnet result.")
+            model = "claude-sonnet-4-6"
 
-    # Tier 3: Claude — if Gemini blocked at either tier
-    if result is None:
-        logger.info("Gemini blocked — falling back to Claude claude-haiku.")
-        model = "claude-haiku-4-5-20251001"
-        result, input_tokens, output_tokens = await _call_claude(frame_paths, caption, has_audio)
-        logger.info(f"{model}: verdict={result.verdict} confidence={result.confidence}")
-
-    input_cost, output_cost = _MODEL_COSTS.get(model, (0.30, 1.00))
+    input_cost, output_cost = _MODEL_COSTS.get(model, (3.00, 15.00))
     cost_usd = (input_tokens * input_cost + output_tokens * output_cost) / 1_000_000
 
     return result.model_copy(update={
