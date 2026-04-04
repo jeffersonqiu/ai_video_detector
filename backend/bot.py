@@ -119,9 +119,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode=ParseMode.HTML,
         )
 
-        # 3. Extract frames + detect
+        # 3. Extract frames + detect (pass caption as extra signal)
         frame_paths = await extract_frames_async(video_path, job_dir)
-        result = await detect_ai_video(frame_paths)
+        result = await detect_ai_video(frame_paths, caption=video_info.description or None)
 
         # 4. Send verdict
         verdict_emoji = {"AI GENERATED": "🤖", "LIKELY REAL": "✅", "UNCERTAIN": "❓"}.get(
