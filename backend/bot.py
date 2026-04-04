@@ -130,7 +130,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         confidence_emoji = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(
             result.confidence, "⚪"
         )
-        model_label = "⚡ Flash-Lite" if "lite" in result.model_used else "🔥 Flash (escalated)"
+        if "lite" in result.model_used:
+            model_label = "⚡ Flash-Lite"
+        elif "claude" in result.model_used:
+            model_label = "🟣 Claude Haiku (Gemini blocked)"
+        else:
+            model_label = "🔥 Flash (escalated)"
         total_tokens = result.input_tokens + result.output_tokens
         cost_str = f"${result.cost_usd:.5f}" if result.cost_usd > 0 else "—"
 

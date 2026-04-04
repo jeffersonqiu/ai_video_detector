@@ -22,6 +22,7 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str = ""
     gemini_api_key: str = ""
+    anthropic_api_key: str = ""
     allowed_telegram_user_id: int = 0
     webhook_secret: str = ""
     railway_public_domain: str = ""
@@ -29,7 +30,7 @@ class Settings(BaseSettings):
     instagram_cookies_b64: Optional[str] = None   # base64-encoded cookies.txt for Railway
     daily_request_limit: int = 50
 
-    @field_validator("telegram_bot_token", "gemini_api_key", "webhook_secret", mode="before")
+    @field_validator("telegram_bot_token", "gemini_api_key", "anthropic_api_key", "webhook_secret", mode="before")
     @classmethod
     def strip_secrets(cls, v: object) -> object:
         return _strip_quotes(v)

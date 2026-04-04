@@ -1,5 +1,7 @@
+import base64
 import logging
 
+import anthropic
 from google import genai
 from google.genai import types
 
@@ -7,16 +9,16 @@ from models import DetectionResult
 
 logger = logging.getLogger(__name__)
 
-# Cost per 1M tokens (input, output) for each model
+# Cost per 1M tokens: (input, output)
 _MODEL_COSTS: dict[str, tuple[float, float]] = {
-    "gemini-2.5-flash-lite": (0.10, 0.40),
-    "gemini-2.5-flash":      (0.30, 1.00),
+    "gemini-2.5-flash-lite":       (0.10, 0.40),
+    "gemini-2.5-flash":            (0.30, 1.00),
+    "claude-haiku-4-5-20251001":   (0.80, 4.00),
 }
 
-# Disable safety blocking entirely for this use case.
-# The detection prompt uses forensic language about skin, faces, and body parts
-# which trips Gemini's filters even on completely normal lifestyle/beauty videos.
-# This is a private single-user bot — the content is user-chosen, not generated.
+# Disable configurable safety filters — the forensic detection prompt combined
+# with human faces trips Gemini's filters on normal lifestyle/beauty videos.
+# Non-configurable model-level refusals still apply; Claude handles those cases.
 _SAFETY_SETTINGS = [
     types.SafetySetting(category="HARM_CATEGORY_HARASSMENT",        threshold="BLOCK_NONE"),
     types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH",       threshold="BLOCK_NONE"),
@@ -24,15 +26,23 @@ _SAFETY_SETTINGS = [
     types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
 ]
 
-# Lazy singleton — created on first API call so import never crashes
-_client: genai.Client | None = None
+# Lazy singletons
+_gemini_client: genai.Client | None = None
+_claude_client: anthropic.AsyncAnthropic | None = None
 
 
-def _get_client() -> genai.Client:
-    global _client
-    if _client is None:
-        _client = genai.Client()
-    return _client
+def _get_gemini() -> genai.Client:
+    global _gemini_client
+    if _gemini_client is None:
+        _gemini_client = genai.Client()
+    return _gemini_client
+
+
+def _get_claude() -> anthropic.AsyncAnthropic:
+    global _claude_client
+    if _claude_client is None:
+        _claude_client = anthropic.AsyncAnthropic()
+    return _claude_client
 
 
 DETECTION_PROMPT = """\
@@ -68,7 +78,7 @@ def _parse_verdict(text: str) -> DetectionResult:
             reason = line.replace("REASON:", "").strip()
 
     if not all([verdict, confidence, reason]):
-        logger.warning(f"Could not fully parse Gemini response: {text!r}")
+        logger.warning(f"Could not fully parse response: {text!r}")
         return DetectionResult(
             verdict="UNCERTAIN",
             confidence="LOW",
@@ -84,13 +94,10 @@ def _parse_verdict(text: str) -> DetectionResult:
     )
 
 
-def _build_config(model: str) -> types.GenerateContentConfig:
-    """Build generation config. Flash has thinking enabled by default — disable it
-    to keep output structured and avoid burning tokens on reasoning."""
+def _build_gemini_config(model: str) -> types.GenerateContentConfig:
     extra = {}
     if model == "gemini-2.5-flash":
         extra["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-
     return types.GenerateContentConfig(
         max_output_tokens=300,
         temperature=0.1,
@@ -100,12 +107,6 @@ def _build_config(model: str) -> types.GenerateContentConfig:
 
 
 def _finish_reason(response) -> str:
-    """Extract finish reason from the response.
-
-    When a prompt is blocked before any candidates are generated,
-    response.candidates is None — not an empty list — so indexing it
-    raises TypeError, not IndexError. Catch all three.
-    """
     try:
         if response.prompt_feedback and response.prompt_feedback.block_reason:
             return f"PROMPT_BLOCKED({response.prompt_feedback.block_reason})"
@@ -114,67 +115,102 @@ def _finish_reason(response) -> str:
         return "UNKNOWN"
 
 
-async def _call_model(
+async def _call_gemini(
     parts: list[types.Part], model: str
-) -> tuple[DetectionResult, int, int]:
+) -> tuple[DetectionResult | None, int, int]:
     """
-    Call a Gemini model with the given parts.
-    Returns (DetectionResult, input_tokens, output_tokens).
+    Call a Gemini model. Returns (None, 0, 0) when the response is blocked
+    so the caller can escalate to the next model.
     """
-    response = await _get_client().aio.models.generate_content(
+    response = await _get_gemini().aio.models.generate_content(
         model=model,
         contents=parts,
-        config=_build_config(model),
+        config=_build_gemini_config(model),
     )
 
-    text = response.text  # None when safety-blocked or no text candidate
+    text = response.text
     if text is None:
         reason = _finish_reason(response)
-        logger.warning(f"Model {model} returned no text. finish_reason={reason}")
-        result = DetectionResult(
-            verdict="UNCERTAIN",
-            confidence="LOW",
-            reason=f"Model could not analyse this video (blocked: {reason}). Try a different clip.",
-            raw_response=None,
-        )
-    else:
-        result = _parse_verdict(text)
+        logger.warning(f"Gemini {model} blocked. reason={reason}")
+        return None, 0, 0
 
     usage = response.usage_metadata
     input_tokens = (usage.prompt_token_count or 0) if usage else 0
     output_tokens = (usage.candidates_token_count or 0) if usage else 0
+    return _parse_verdict(text), input_tokens, output_tokens
 
-    return result, input_tokens, output_tokens
+
+async def _call_claude(frame_paths: list[str]) -> tuple[DetectionResult, int, int]:
+    """
+    Call Claude claude-haiku as a fallback when Gemini blocks.
+    Rebuilds image parts from disk since Gemini parts aren't reusable.
+    """
+    model = "claude-haiku-4-5-20251001"
+    content: list[dict] = [{"type": "text", "text": DETECTION_PROMPT}]
+
+    for frame_path in frame_paths:
+        with open(frame_path, "rb") as f:
+            image_b64 = base64.standard_b64encode(f.read()).decode()
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64},
+        })
+
+    response = await _get_claude().messages.create(
+        model=model,
+        max_tokens=300,
+        messages=[{"role": "user", "content": content}],
+    )
+
+    text = response.content[0].text if response.content else None
+    if not text:
+        return DetectionResult(
+            verdict="UNCERTAIN",
+            confidence="LOW",
+            reason="Claude returned no response.",
+            raw_response=None,
+        ), 0, 0
+
+    input_tokens = response.usage.input_tokens
+    output_tokens = response.usage.output_tokens
+    return _parse_verdict(text), input_tokens, output_tokens
 
 
 async def detect_ai_video(frame_paths: list[str]) -> DetectionResult:
     """
-    Sends frames to Gemini for AI detection.
-
-    Uses gemini-2.5-flash-lite first. If confidence is LOW, automatically
-    escalates to gemini-2.5-flash for a second opinion.
-
-    Returns DetectionResult with verdict, confidence, reason, model used, and cost.
+    Analysis pipeline with three-tier model escalation:
+      1. gemini-2.5-flash-lite  — fast and cheap
+      2. gemini-2.5-flash       — if confidence is LOW
+      3. claude-haiku-4-5       — if Gemini blocks (model-level refusal)
     """
-    parts: list[types.Part] = [types.Part.from_text(text=DETECTION_PROMPT)]
+    # Build Gemini parts once and reuse across both Gemini calls
+    gemini_parts: list[types.Part] = [types.Part.from_text(text=DETECTION_PROMPT)]
     for frame_path in frame_paths:
         with open(frame_path, "rb") as f:
-            image_bytes = f.read()
-        parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
+            gemini_parts.append(types.Part.from_bytes(data=f.read(), mime_type="image/jpeg"))
 
-    # First pass: cheap fast model
+    # Tier 1: Flash-Lite
     model = "gemini-2.5-flash-lite"
-    result, input_tokens, output_tokens = await _call_model(parts, model)
-    logger.info(f"{model}: verdict={result.verdict} confidence={result.confidence} tokens={input_tokens}+{output_tokens}")
-
-    # Escalate to full Flash if confidence is low
-    if result.confidence == "LOW":
-        logger.info("Low confidence — escalating to gemini-2.5-flash.")
-        model = "gemini-2.5-flash"
-        result, input_tokens, output_tokens = await _call_model(parts, model)
+    result, input_tokens, output_tokens = await _call_gemini(gemini_parts, model)
+    if result:
         logger.info(f"{model}: verdict={result.verdict} confidence={result.confidence} tokens={input_tokens}+{output_tokens}")
 
-    input_cost, output_cost = _MODEL_COSTS[model]
+    # Tier 2: Flash (if low confidence)
+    if result and result.confidence == "LOW":
+        logger.info("Low confidence — escalating to gemini-2.5-flash.")
+        model = "gemini-2.5-flash"
+        result, input_tokens, output_tokens = await _call_gemini(gemini_parts, model)
+        if result:
+            logger.info(f"{model}: verdict={result.verdict} confidence={result.confidence} tokens={input_tokens}+{output_tokens}")
+
+    # Tier 3: Claude (if Gemini blocked at either tier)
+    if result is None:
+        logger.info("Gemini blocked — falling back to Claude claude-haiku.")
+        model = "claude-haiku-4-5-20251001"
+        result, input_tokens, output_tokens = await _call_claude(frame_paths)
+        logger.info(f"{model}: verdict={result.verdict} confidence={result.confidence} tokens={input_tokens}+{output_tokens}")
+
+    input_cost, output_cost = _MODEL_COSTS.get(model, (0.30, 1.00))
     cost_usd = (input_tokens * input_cost + output_tokens * output_cost) / 1_000_000
 
     return result.model_copy(update={
