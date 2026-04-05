@@ -423,13 +423,14 @@ async def detect_ai_video(
     video_path: str | None = None,
 ) -> DetectionResult:
     """
-    Multi-signal detection pipeline:
-      - Caption pre-screened for AI keywords before vision calls
-      - Structured prompt forces model to reason per-signal then synthesize
+    Multi-signal detection pipeline (research-validated, cost-optimised):
 
-    Escalation logic:
-      1. claude-sonnet-4-6   — primary; best reasoning, vision + caption
-      2. gemini-2.5-flash    — escalation if LOW confidence (adds audio support)
+      Tier 1: gemini-2.5-flash + audio  — $0.0016/video, catches subtle AI
+      Tier 2: claude-sonnet-4-6         — fallback if Gemini blocked or LOW confidence
+                                           $0.039/video, highest accuracy
+
+    Research finding: Flash + audio matches Sonnet accuracy at 96% lower cost.
+    Flash-Lite and Haiku were tested and miss sophisticated AI-generated videos.
     """
     from services.audio_extractor import extract_audio_async
 
@@ -437,7 +438,7 @@ async def detect_ai_video(
     if caption:
         logger.info(f"Caption: {caption[:80]!r} → signal={signal}")
 
-    # Extract audio (used by Gemini escalation tier)
+    # Extract audio — critical signal, Flash uses it inline
     audio_path: str | None = None
     if video_path:
         output_dir = os.path.dirname(frame_paths[0])
@@ -448,38 +449,37 @@ async def detect_ai_video(
 
     has_audio = audio_path is not None
 
-    # Tier 1: Claude Sonnet — vision + caption + structured reasoning
-    model = "claude-sonnet-4-6"
-    result, input_tokens, output_tokens = await _call_claude(
-        frame_paths, caption, has_audio, model=model
-    )
-    logger.info(f"{model}: verdict={result.verdict} confidence={result.confidence} caption_signal={signal}")
+    # Build Gemini image parts
+    image_parts: list[types.Part] = []
+    for frame_path in frame_paths:
+        with open(frame_path, "rb") as f:
+            image_parts.append(types.Part.from_bytes(data=f.read(), mime_type="image/jpeg"))
 
-    # Tier 2: Gemini Flash — escalate if LOW confidence or strong caption conflicts with verdict
-    # Gemini also brings audio analysis which Claude doesn't support
-    should_escalate = result.confidence == "LOW" or (
-        signal == "STRONG" and result.verdict != "AI GENERATED"
+    # Tier 1: Gemini 2.5 Flash (no thinking) + audio
+    model = "gemini-2.5-flash"
+    result, input_tokens, output_tokens = await _call_gemini(
+        image_parts, model, caption, audio_path
+    )
+    if result:
+        logger.info(f"{model}: verdict={result.verdict} confidence={result.confidence} caption_signal={signal}")
+
+    # Tier 2: Claude Sonnet — if Gemini blocked OR low confidence OR strong caption conflicts
+    should_escalate = result is None or result.confidence == "LOW" or (
+        signal == "STRONG" and result is not None and result.verdict != "AI GENERATED"
     )
     if should_escalate:
-        reason = "low confidence" if result.confidence == "LOW" else "strong caption signal conflicts with verdict"
-        logger.info(f"Escalating to gemini-2.5-flash ({reason}).")
-
-        image_parts: list[types.Part] = []
-        for frame_path in frame_paths:
-            with open(frame_path, "rb") as f:
-                image_parts.append(types.Part.from_bytes(data=f.read(), mime_type="image/jpeg"))
-
-        model = "gemini-2.5-flash"
-        gemini_result, g_input, g_output = await _call_gemini(
-            image_parts, model, caption, audio_path
-        )
-        if gemini_result:
-            result, input_tokens, output_tokens = gemini_result, g_input, g_output
-            logger.info(f"{model}: verdict={result.verdict} confidence={result.confidence}")
+        if result is None:
+            reason = "Gemini blocked"
+        elif result.confidence == "LOW":
+            reason = "low confidence"
         else:
-            # Gemini blocked — stick with Sonnet result
-            logger.info("Gemini escalation blocked — keeping Sonnet result.")
-            model = "claude-sonnet-4-6"
+            reason = "strong caption signal conflicts with verdict"
+        logger.info(f"Escalating to claude-sonnet-4-6 ({reason}).")
+        model = "claude-sonnet-4-6"
+        result, input_tokens, output_tokens = await _call_claude(
+            frame_paths, caption, has_audio, model=model
+        )
+        logger.info(f"{model}: verdict={result.verdict} confidence={result.confidence}")
 
     input_cost, output_cost = _MODEL_COSTS.get(model, (3.00, 15.00))
     cost_usd = (input_tokens * input_cost + output_tokens * output_cost) / 1_000_000

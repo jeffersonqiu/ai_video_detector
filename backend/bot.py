@@ -170,13 +170,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             result.confidence, "⚪"
         )
         if "sonnet" in result.model_used:
-            model_label = "🟣 Claude Sonnet"
+            model_label = "🟣 Claude Sonnet (escalated)"
         elif "haiku" in result.model_used:
             model_label = "🟣 Claude Haiku"
         elif "lite" in result.model_used:
             model_label = "⚡ Gemini Flash-Lite"
         else:
-            model_label = "🔥 Gemini Flash (escalated)"
+            model_label = "🔥 Gemini Flash"
         total_tokens = result.input_tokens + result.output_tokens
         cost_str = f"${result.cost_usd:.5f}" if result.cost_usd > 0 else "—"
 
