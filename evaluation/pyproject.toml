@@ -1,0 +1,11 @@
+[project]
+name = "ai-video-detector-eval"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "google-genai>=1.0.0",
+    "anthropic>=0.49.0",
+    "yt-dlp>=2026.3.17",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
