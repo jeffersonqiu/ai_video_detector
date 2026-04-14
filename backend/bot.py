@@ -89,10 +89,6 @@ def build_bot() -> commands.Bot:
         if message.author.bot:
             return
 
-        # Only process DMs
-        if not isinstance(message.channel, discord.DMChannel):
-            return
-
         if message.author.id not in settings.get_allowed_discord_user_ids():
             logger.warning(f"Rejected message from user_id={message.author.id}")
             await message.channel.send("Sorry, this bot is private.")
