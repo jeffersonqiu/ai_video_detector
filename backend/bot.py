@@ -1,22 +1,18 @@
-import html
 import logging
 import os
 import re
 import uuid
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import discord
+from discord.ext import commands
 
 from config import settings
-from models import DetectionResult
 from rate_limiter import check_and_increment_daily_limit
 from services.cleanup import cleanup_job
 from services.detector import detect_ai_video
 from services.downloader import (
     DownloadError,
     UnsupportedPlatformError,
-    VideoInfo,
     download_video,
 )
 from services.frame_extractor import FrameExtractionError, extract_frames_async
@@ -41,187 +37,131 @@ def _format_duration(seconds: int | None) -> str:
     return f"{m}:{s:02d}"
 
 
-def _h(text: str) -> str:
-    """Escape a string for safe use in Telegram HTML mode."""
-    return html.escape(str(text))
+def _build_embed(result, video_info) -> discord.Embed:
+    verdict_emoji = {"AI GENERATED": "🤖", "LIKELY REAL": "✅", "UNCERTAIN": "❓"}.get(
+        result.verdict, "❓"
+    )
+    confidence_emoji = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(
+        result.confidence, "⚪"
+    )
+    if "sonnet" in result.model_used:
+        model_label = "🟣 Claude Sonnet (escalated)"
+    elif "haiku" in result.model_used:
+        model_label = "🟣 Claude Haiku"
+    elif "lite" in result.model_used:
+        model_label = "⚡ Gemini Flash-Lite"
+    else:
+        model_label = "🔥 Gemini Flash"
 
+    total_tokens = result.input_tokens + result.output_tokens
+    cost_str = f"${result.cost_usd:.5f}" if result.cost_usd > 0 else "—"
 
-def _is_allowed(update: Update) -> bool:
-    """
-    Allow the request if:
-    - The user is the whitelisted owner, OR
-    - The message comes from a whitelisted group chat
-    """
-    user = update.effective_user
-    chat = update.effective_chat
-    if user and user.id == settings.allowed_telegram_user_id:
-        return True
-    if chat and chat.id in settings.get_allowed_chat_ids():
-        return True
-    return False
-
-
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    logger.info(f"/start from user_id={user.id if user else 'unknown'}")
-    await update.message.reply_text(
-        "👋 Hi! I'm an AI video detector.\n\n"
-        "Send me an Instagram Reel or TikTok link and I'll tell you "
-        "if the video was AI-generated.\n\n"
-        "Just paste the link as a message."
+    embed_color = {"AI GENERATED": 0xEF4444, "LIKELY REAL": 0x22C55E, "UNCERTAIN": 0xF59E0B}.get(
+        result.verdict, 0x94A3B8
     )
 
-
-async def chatid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reply with the current chat ID — useful for adding a group to ALLOWED_CHAT_IDS."""
-    chat = update.effective_chat
-    user = update.effective_user
-    # Only the owner can use this command
-    if not user or user.id != settings.allowed_telegram_user_id:
-        return
-    await update.message.reply_text(
-        f"Chat ID: <code>{chat.id}</code>\n\n"
-        f"Add this to <b>ALLOWED_CHAT_IDS</b> in Railway to allow this chat.",
-        parse_mode=ParseMode.HTML,
+    embed = discord.Embed(
+        title=f"{verdict_emoji} {result.verdict}",
+        color=embed_color,
     )
+    embed.add_field(name="Confidence", value=f"{confidence_emoji} {result.confidence}", inline=True)
+    embed.add_field(name="Model", value=model_label, inline=True)
+    embed.add_field(name="Analysis", value=result.reason, inline=False)
+    embed.set_footer(text=f"@{video_info.uploader} · {total_tokens:,} tokens · {cost_str}")
+    return embed
 
 
-async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or user.id != settings.allowed_telegram_user_id:
-        return
-    try:
-        webhook_info = await context.bot.get_webhook_info()
-        url = webhook_info.url or "NOT SET"
-        pending = webhook_info.pending_update_count
-        last_error = webhook_info.last_error_message or "none"
-        await update.message.reply_text(
-            f"🔧 <b>Webhook Status</b>\n\n"
-            f"URL: <code>{_h(url)}</code>\n"
-            f"Pending updates: {pending}\n"
-            f"Last error: {_h(last_error)}",
-            parse_mode=ParseMode.HTML,
+def build_bot() -> commands.Bot:
+    intents = discord.Intents.default()
+    intents.message_content = True  # Privileged intent — must be enabled in Discord Dev Portal
+
+    bot = commands.Bot(command_prefix="!", intents=intents)
+
+    @bot.event
+    async def on_ready():
+        logger.info(
+            f"Discord bot ready: {bot.user} | "
+            f"message_content intent active: {bot.intents.message_content}"
         )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Could not fetch webhook info: {_h(str(e))}")
 
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user:
-        return
-
-    if not _is_allowed(update):
-        logger.warning(f"Rejected message from user_id={user.id} chat_id={update.effective_chat.id}")
-        await update.message.reply_text("Sorry, this bot is private.")
-        return
-
-    text = (update.message.text or "").strip()
-    url = _extract_url(text)
-
-    if not url:
-        # In groups, stay silent when no URL (avoid spamming for every message)
-        chat = update.effective_chat
-        if chat and chat.type != "private":
+    @bot.event
+    async def on_message(message: discord.Message):
+        if message.author.bot:
             return
-        await update.message.reply_text("Please send an Instagram Reel or TikTok link.")
-        return
 
-    if not check_and_increment_daily_limit():
-        await update.message.reply_text("⚠️ Daily analysis limit reached. Try again tomorrow.")
-        return
+        # Only process DMs
+        if not isinstance(message.channel, discord.DMChannel):
+            return
 
-    status_msg = await update.message.reply_text("⏳ Got your link! Downloading video...")
+        if message.author.id != settings.allowed_discord_user_id:
+            logger.warning(f"Rejected message from user_id={message.author.id}")
+            await message.channel.send("Sorry, this bot is private.")
+            return
 
-    job_id = str(uuid.uuid4())
-    job_dir = f"/tmp/detector_{job_id}"
-    os.makedirs(job_dir, exist_ok=True)
+        text = (message.content or "").strip()
+        url = _extract_url(text)
 
-    frame_paths: list[str] = []
+        if not url:
+            await message.channel.send("Please send an Instagram Reel or TikTok link.")
+            return
 
-    try:
-        # 1. Download
-        video_path, video_info = await download_video(url, job_dir)
+        if not check_and_increment_daily_limit():
+            await message.channel.send("⚠️ Daily analysis limit reached. Try again tomorrow.")
+            return
 
-        # 2. Show video info while analysing
-        duration_str = _format_duration(video_info.duration_seconds)
-        duration_part = f" · {duration_str}" if duration_str else ""
-        desc_part = f"\n<i>{_h(video_info.description)}</i>" if video_info.description else ""
+        status_msg = await message.channel.send("⏳ Got your link! Downloading video...")
 
-        await status_msg.edit_text(
-            f"🎬 <b>@{_h(video_info.uploader)}</b>{_h(duration_part)}{desc_part}\n\n"
-            f"🔍 Analysing frames with AI...",
-            parse_mode=ParseMode.HTML,
-        )
+        job_id = str(uuid.uuid4())
+        job_dir = f"/tmp/detector_{job_id}"
+        os.makedirs(job_dir, exist_ok=True)
 
-        # 3. Extract frames + detect
-        frame_paths = await extract_frames_async(video_path, job_dir)
-        result = await detect_ai_video(
-            frame_paths,
-            caption=video_info.description or None,
-            video_path=video_path,
-        )
+        frame_paths: list[str] = []
 
-        # 4. Build verdict text
-        verdict_emoji = {"AI GENERATED": "🤖", "LIKELY REAL": "✅", "UNCERTAIN": "❓"}.get(
-            result.verdict, "❓"
-        )
-        confidence_emoji = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(
-            result.confidence, "⚪"
-        )
-        if "sonnet" in result.model_used:
-            model_label = "🟣 Claude Sonnet (escalated)"
-        elif "haiku" in result.model_used:
-            model_label = "🟣 Claude Haiku"
-        elif "lite" in result.model_used:
-            model_label = "⚡ Gemini Flash-Lite"
-        else:
-            model_label = "🔥 Gemini Flash"
-        total_tokens = result.input_tokens + result.output_tokens
-        cost_str = f"${result.cost_usd:.5f}" if result.cost_usd > 0 else "—"
+        try:
+            # 1. Download
+            video_path, video_info = await download_video(url, job_dir)
 
-        verdict_caption = (
-            f"{verdict_emoji} <b>{_h(result.verdict)}</b>\n"
-            f"{confidence_emoji} Confidence: <b>{_h(result.confidence)}</b>\n\n"
-            f"📝 {_h(result.reason)}\n\n"
-            f"— @{_h(video_info.uploader)}\n"
-            f"<i>{model_label} · {total_tokens:,} tokens · {cost_str}</i>"
-        )
+            # 2. Show video info while analysing
+            duration_str = _format_duration(video_info.duration_seconds)
+            duration_part = f" · {duration_str}" if duration_str else ""
 
-        # 5. Send verdict — as photo (middle frame) with caption if frames available,
-        #    otherwise fall back to editing the status text message
-        middle_frame = frame_paths[len(frame_paths) // 2] if frame_paths else None
-        if middle_frame and os.path.exists(middle_frame):
+            await status_msg.edit(
+                content=f"🎬 **@{video_info.uploader}**{duration_part}\n\n🔍 Analysing frames with AI..."
+            )
+
+            # 3. Extract frames + detect
+            frame_paths = await extract_frames_async(video_path, job_dir)
+            result = await detect_ai_video(
+                frame_paths,
+                caption=video_info.description or None,
+                video_path=video_path,
+            )
+
+            # 4. Build embed
+            embed = _build_embed(result, video_info)
+
+            # 5. Send verdict — attach middle frame as image if available
+            middle_frame = frame_paths[len(frame_paths) // 2] if frame_paths else None
             await status_msg.delete()
-            with open(middle_frame, "rb") as f:
-                await update.message.reply_photo(
-                    photo=f,
-                    caption=verdict_caption,
-                    parse_mode=ParseMode.HTML,
-                )
-        else:
-            await status_msg.edit_text(verdict_caption, parse_mode=ParseMode.HTML)
 
-    except UnsupportedPlatformError:
-        await status_msg.edit_text("❌ Only Instagram Reels and TikTok links are supported.")
-    except DownloadError as e:
-        await status_msg.edit_text(f"❌ Could not download video: {_h(str(e))}")
-    except FrameExtractionError as e:
-        await status_msg.edit_text(f"❌ Could not process video frames: {_h(str(e))}")
-    except Exception as e:
-        logger.exception(f"Pipeline error for URL {url!r}: {e}")
-        await status_msg.edit_text(
-            f"❌ Something went wrong:\n<code>{_h(type(e).__name__)}: {_h(str(e))}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-    finally:
-        cleanup_job(job_dir)
+            if middle_frame and os.path.exists(middle_frame):
+                embed.set_image(url="attachment://frame.jpg")
+                with open(middle_frame, "rb") as f:
+                    file = discord.File(f, filename="frame.jpg")
+                    await message.channel.send(file=file, embed=embed)
+            else:
+                await message.channel.send(embed=embed)
 
+        except UnsupportedPlatformError:
+            await status_msg.edit(content="❌ Only Instagram Reels and TikTok links are supported.")
+        except DownloadError as e:
+            await status_msg.edit(content=f"❌ Could not download video: {e}")
+        except FrameExtractionError as e:
+            await status_msg.edit(content=f"❌ Could not process video frames: {e}")
+        except Exception as e:
+            logger.exception(f"Pipeline error for URL {url!r}: {e}")
+            await status_msg.edit(content=f"❌ Something went wrong: {type(e).__name__}: {e}")
+        finally:
+            cleanup_job(job_dir)
 
-def build_application() -> Application:
-    app = Application.builder().token(settings.telegram_bot_token).build()
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("debug", debug_handler))
-    app.add_handler(CommandHandler("chatid", chatid_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    return app
+    return bot

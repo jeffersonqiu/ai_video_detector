@@ -20,23 +20,15 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    telegram_bot_token: str = ""
+    discord_bot_token: str = ""
     gemini_api_key: str = ""
     anthropic_api_key: str = ""
-    allowed_telegram_user_id: int = 0
-    webhook_secret: str = ""
-    railway_public_domain: str = ""
+    allowed_discord_user_id: int = 0
     instagram_cookies_file: Optional[str] = None
     instagram_cookies_b64: Optional[str] = None   # base64-encoded cookies.txt for Railway
     daily_request_limit: int = 50
-    allowed_chat_ids: str = ""  # comma-separated group chat IDs that may use the bot
 
-    def get_allowed_chat_ids(self) -> list[int]:
-        if not self.allowed_chat_ids:
-            return []
-        return [int(x.strip()) for x in self.allowed_chat_ids.split(",") if x.strip().lstrip("-").isdigit()]
-
-    @field_validator("telegram_bot_token", "gemini_api_key", "anthropic_api_key", "webhook_secret", mode="before")
+    @field_validator("discord_bot_token", "gemini_api_key", "anthropic_api_key", mode="before")
     @classmethod
     def strip_secrets(cls, v: object) -> object:
         return _strip_quotes(v)
