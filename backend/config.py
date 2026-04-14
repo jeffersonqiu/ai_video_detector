@@ -23,7 +23,12 @@ class Settings(BaseSettings):
     discord_bot_token: str = ""
     gemini_api_key: str = ""
     anthropic_api_key: str = ""
-    allowed_discord_user_id: int = 0
+    allowed_discord_user_ids: str = ""  # comma-separated Discord user IDs
+
+    def get_allowed_discord_user_ids(self) -> list[int]:
+        if not self.allowed_discord_user_ids:
+            return []
+        return [int(x.strip()) for x in self.allowed_discord_user_ids.split(",") if x.strip().isdigit()]
     instagram_cookies_file: Optional[str] = None
     instagram_cookies_b64: Optional[str] = None   # base64-encoded cookies.txt for Railway
     daily_request_limit: int = 50

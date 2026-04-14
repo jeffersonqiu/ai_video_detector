@@ -36,7 +36,14 @@ async def lifespan(app: FastAPI):
     try:
         from bot import build_bot
         discord_bot = build_bot()
+        if not settings.discord_bot_token:
+            raise ValueError("DISCORD_BOT_TOKEN is not set in environment.")
+        logger.info(f"Discord bot token loaded (length={len(settings.discord_bot_token)})")
         task = asyncio.create_task(discord_bot.start(settings.discord_bot_token))
+        task.add_done_callback(
+            lambda t: logger.error(f"Discord bot task ended unexpectedly: {t.exception()}")
+            if not t.cancelled() and t.exception() else None
+        )
         logger.info("Discord Gateway bot starting...")
     except Exception:
         logger.exception("Discord bot startup failed — bot will be unavailable, but /health still responds.")

@@ -33,7 +33,8 @@ _claude_client: anthropic.AsyncAnthropic | None = None
 def _get_gemini() -> genai.Client:
     global _gemini_client
     if _gemini_client is None:
-        _gemini_client = genai.Client()
+        from config import settings
+        _gemini_client = genai.Client(api_key=settings.gemini_api_key)
     return _gemini_client
 
 
