@@ -2,32 +2,31 @@
 
 ## Project Purpose
 
-A Telegram bot that lets a non-technical user (single user: dad) send an Instagram
+A Discord bot that lets a non-technical user (single user: dad) send an Instagram
 Reel or TikTok link and receive a verdict on whether the video is AI-generated or
-real. Zero setup required on the user's side beyond installing Telegram and adding
-one bot contact.
+real. Dad joins a shared Discord server — no technical setup beyond installing Discord.
 
 ---
 
 ## Architecture Overview
 
 ```
-Dad's Android (Telegram)
-        │  sends IG/TikTok URL as a message
+Dad's Android (Discord)
+        │  sends IG/TikTok URL in shared server channel or DM
         ▼
-Telegram Bot (python-telegram-bot v20+, async)
-        │  receives message, validates URL
+Discord Bot (discord.py v2, Gateway WebSocket, async)
+        │  receives message, validates URL, checks ALLOWED_DISCORD_USER_IDS
         ▼
 FastAPI Backend (Railway)
         │
         ├─► yt-dlp  ──────────────────── downloads video to /tmp/<job_id>.mp4
         │
-        ├─► ffmpeg ───────────────────── extracts 8 evenly-spaced frames → /tmp/<job_id>/frame_N.jpg
+        ├─► ffmpeg ───────────────────── extracts frames + audio → /tmp/<job_id>/
         │
-        ├─► google-genai SDK ──────────── sends 8 frames as inline base64 images to Gemini 2.5 Flash-Lite
+        ├─► google-genai SDK ──────────── Gemini 2.5 Flash + Flash-Lite (3-tier routing)
         │                                 receives structured verdict
         ▼
-Telegram Bot replies with formatted verdict message
+Discord Bot replies with embed card (coloured verdict + middle frame image)
         │
         ▼
 /tmp cleanup — deletes video + frames after response
