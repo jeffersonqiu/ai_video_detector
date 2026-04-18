@@ -14,6 +14,7 @@ import base64
 import logging
 import os
 import re
+import sys
 
 from google import genai
 from google.genai import types
@@ -21,13 +22,30 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Gradient prefilter — zero-cost short-circuit before any LLM call
+# ---------------------------------------------------------------------------
+
+_BACKEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend")
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+
+try:
+    from research.gradient_prefilter.prefilter import run_prefilter as _run_prefilter
+    _PREFILTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"Gradient prefilter not available: {_e}")
+    _PREFILTER_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
 # Strategy metadata — shown in the harness output and logged in results.jsonl
 # ---------------------------------------------------------------------------
 
-STRATEGY_NAME = "caption-routing-flash-audioonly-lite15"
+STRATEGY_NAME = "gradient-prefilter-plus-caption-routing-lite15"
 STRATEGY_DESCRIPTION = (
-    "3-tier routing: STRONG→free | timelapse→Flash+audio+18frames | "
-    "default→Flash-Lite+audio+15frames."
+    "Tier 0: gradient prefilter (free, CPU) | "
+    "Tier 1: STRONG caption→free | "
+    "Tier 2: timelapse→Flash+audio+18frames | "
+    "Tier 3: default→Flash-Lite+audio+15frames."
 )
 
 # ---------------------------------------------------------------------------
@@ -271,9 +289,23 @@ async def detect(
     Returns dict with keys: verdict, confidence, reason, model_used,
     input_tokens, output_tokens, cost_usd.
     """
+    # Tier 0: gradient prefilter (zero cost, CPU-only)
+    if _PREFILTER_AVAILABLE:
+        prefilter_result = _run_prefilter(frames[:8])
+        if prefilter_result is not None:
+            return {
+                "verdict": prefilter_result.verdict,
+                "confidence": prefilter_result.confidence,
+                "reason": prefilter_result.reason,
+                "model_used": prefilter_result.model_used,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0.0,
+            }
+
     route = _routing(caption)
 
-    # Tier 0: free caption-only
+    # Tier 1 (was Tier 0): free caption-only
     if route == "FREE":
         return {
             "verdict": "AI GENERATED",
