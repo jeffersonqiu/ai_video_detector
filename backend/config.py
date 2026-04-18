@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     instagram_cookies_file: Optional[str] = None
     instagram_cookies_b64: Optional[str] = None   # base64-encoded cookies.txt for Railway
     daily_request_limit: int = 50
+    prefilter_enabled: bool = False  # env: PREFILTER_ENABLED=true to activate
 
     @field_validator("discord_bot_token", "gemini_api_key", "anthropic_api_key", mode="before")
     @classmethod

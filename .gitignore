@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 *.egg-info/
 cookies*.txt
+backend/research/gradient_prefilter/data/

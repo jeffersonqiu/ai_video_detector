@@ -439,6 +439,25 @@ async def detect_ai_video(
     if caption:
         logger.info(f"Caption: {caption[:80]!r} → signal={signal}")
 
+    # Gradient prefilter — short-circuit before any LLM call (zero cost)
+    from config import settings as _settings
+    if _settings.prefilter_enabled:
+        from research.gradient_prefilter.prefilter import run_prefilter
+        prefilter_result = run_prefilter(frame_paths)
+        if prefilter_result is not None:
+            return prefilter_result
+    else:
+        # Shadow mode: log what prefilter would have done, but always continue to LLM
+        try:
+            from research.gradient_prefilter.prefilter import run_prefilter
+            shadow = run_prefilter(frame_paths)
+            if shadow is not None:
+                logger.info("SHADOW prefilter would short-circuit: AI GENERATED / HIGH")
+            else:
+                logger.info("SHADOW prefilter: uncertain, would fall through to LLM")
+        except Exception:
+            pass  # Shadow mode failure is never fatal
+
     # Extract audio — critical signal, Flash uses it inline
     audio_path: str | None = None
     if video_path:
